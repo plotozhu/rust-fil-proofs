@@ -79,6 +79,7 @@ where
     cache_lookup(&*VERIFYING_KEY_MEMORY_CACHE, vk_identifier, generator)
 }
 
+#[allow(dead_code)]
 pub fn get_stacked_params(porep_config: PoRepConfig) -> Result<Arc<groth16::Parameters<Bls12>>> {
     let public_params = public_params(
         PaddedBytesAmount::from(porep_config),

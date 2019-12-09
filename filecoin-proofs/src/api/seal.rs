@@ -22,11 +22,11 @@ use storage_proofs::stacked::{
 };
 
 use crate::api::util::{as_safe_commitment, commitment_from_fr};
-use crate::caches::{get_stacked_params, get_stacked_verifying_key};
+use crate::caches::get_stacked_verifying_key;
 use crate::constants::{
     DefaultPieceHasher, POREP_WINDOW_MINIMUM_CHALLENGES, SINGLE_PARTITION_PROOF_LEN,
 };
-use crate::parameters::setup_params;
+use crate::parameters::{public_params, setup_params};
 pub use crate::pieces;
 pub use crate::pieces::verify_pieces;
 use crate::types::{
@@ -253,7 +253,20 @@ pub fn seal_commit<T: AsRef<Path>>(
         t_aux: t_aux_cache,
     };
 
-    let groth_params = get_stacked_params(porep_config)?;
+    // The following will read all params in RAM.
+    //let groth_params = get_stacked_params(porep_config)?;
+
+    // The following allows for lazy-loading of params via mmap
+    let public_params = public_params(
+        PaddedBytesAmount::from(porep_config),
+        usize::from(PoRepProofPartitions::from(porep_config)),
+    )?;
+
+    let groth_params = <StackedCompound as CompoundProof<
+        _,
+        StackedDrg<DefaultTreeHasher, DefaultPieceHasher>,
+        _,
+    >>::groth_params_mapped::<rand::rngs::OsRng>(None, &public_params)?;
 
     info!(
         "got groth params ({}) while sealing",
@@ -270,7 +283,18 @@ pub fn seal_commit<T: AsRef<Path>>(
 
     let compound_public_params = StackedCompound::setup(&compound_setup_params)?;
 
+    // The following requires all params in RAM.
+    /*
     let proof = StackedCompound::prove(
+        &compound_public_params,
+        &public_inputs,
+        &private_inputs,
+        &groth_params,
+    )?;
+     */
+
+    // The following allows for lazy-loading of params via mmap.
+    let proof = StackedCompound::prove_mapped(
         &compound_public_params,
         &public_inputs,
         &private_inputs,

@@ -10,6 +10,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use memmap::MmapOptions;
 use std::env;
 use std::fs::{self, create_dir_all, File};
 use std::io::{self, SeekFrom};
@@ -209,6 +210,17 @@ where
         read_cached_params(&cache_path).or_else(|_| write_cached_params(&cache_path, generate()?))
     }
 
+    fn get_groth_params_mapped<R: RngCore>(
+        _rng: Option<&mut R>,
+        _circuit: C,
+        pub_params: &P,
+    ) -> Result<groth16::MappedParameters<E>> {
+        let id = Self::cache_identifier(pub_params);
+        // load Groth parameter mappings
+        let cache_path = ensure_ancestor_dirs_exist(parameter_cache_params_path(&id))?;
+        Ok(read_cached_mapped_params(&cache_path)?)
+    }
+
     fn get_verifying_key<R: RngCore>(
         rng: Option<&mut R>,
         circuit: C,
@@ -239,12 +251,32 @@ fn ensure_parent(path: &PathBuf) -> Result<()> {
     }
 }
 
+// Reads parameters using mmap, but not lazily (proof of concept
+// code, not hooked in).
 fn read_cached_params<E: JubjubEngine>(
     cache_entry_path: &PathBuf,
 ) -> Result<groth16::Parameters<E>> {
     info!("checking cache_path: {:?} for parameters", cache_entry_path);
-    with_exclusive_read_lock(cache_entry_path, |mut f| {
-        let params = Parameters::read(&mut f, false)?;
+    with_exclusive_read_lock(cache_entry_path, |_| {
+        let params = unsafe {
+            let param_file = File::open(cache_entry_path)?;
+            let map = MmapOptions::new().map(&param_file)?;
+            Parameters::read_mmap(&map, false)
+        }?;
+        info!("read parameters from cache {:?} ", cache_entry_path);
+
+        Ok(params)
+    })
+}
+
+// Reads parameter mappings using mmap so that they can be lazily
+// loaded later.
+fn read_cached_mapped_params<E: JubjubEngine>(
+    cache_entry_path: &PathBuf,
+) -> Result<groth16::MappedParameters<E>> {
+    info!("checking cache_path: {:?} for parameters", cache_entry_path);
+    with_exclusive_read_lock(cache_entry_path, |_| {
+        let params = Parameters::build_mapped_parameters(cache_entry_path.to_path_buf(), false)?;
         info!("read parameters from cache {:?} ", cache_entry_path);
 
         Ok(params)

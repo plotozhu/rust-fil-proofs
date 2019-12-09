@@ -115,6 +115,57 @@ where
         Ok(MultiProof::new(groth_proofs?, &groth_params.vk))
     }
 
+    /// prove is equivalent to ProofScheme::prove.
+    fn prove_mapped<'b>(
+        pub_params: &PublicParams<'a, S>,
+        pub_in: &S::PublicInputs,
+        priv_in: &S::PrivateInputs,
+        groth_params: &'b groth16::MappedParameters<E>,
+    ) -> Result<MultiProof<'b, E>>
+    where
+        E::Params: Sync,
+    {
+        let partitions = Self::partition_count(pub_params);
+        let partition_count = Self::partition_count(pub_params);
+
+        // This will always run at least once, since there cannot be zero partitions.
+        ensure!(partition_count > 0, "There must be partitions");
+
+        info!("vanilla_proof:start");
+        let vanilla_proofs =
+            S::prove_all_partitions(&pub_params.vanilla_params, &pub_in, priv_in, partitions)?;
+
+        info!("vanilla_proof:finish");
+
+        let sanity_check =
+            S::verify_all_partitions(&pub_params.vanilla_params, &pub_in, &vanilla_proofs)?;
+        ensure!(sanity_check, "sanity check failed");
+
+        // Use a custom pool for this, so we can control the number of threads being used.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(settings::SETTINGS.lock().unwrap().num_proving_threads)
+            .build()
+            .context("failed to build thread pool")?;
+
+        info!("snark_proof:start");
+        let groth_proofs: Result<Vec<_>> = pool.install(|| {
+            vanilla_proofs
+                .par_iter()
+                .map(|vanilla_proof| {
+                    Self::circuit_proof_mapped(
+                        pub_in,
+                        &vanilla_proof,
+                        &pub_params.vanilla_params,
+                        &groth_params,
+                    )
+                })
+                .collect()
+        });
+        info!("snark_proof:finish");
+
+        Ok(MultiProof::new(groth_proofs?, &groth_params.vk))
+    }
+
     // verify is equivalent to ProofScheme::verify.
     fn verify<'b>(
         public_params: &PublicParams<'a, S>,
@@ -179,6 +230,38 @@ where
         Ok(gp)
     }
 
+    /// circuit_proof creates and synthesizes a circuit from concrete params/inputs, then generates a
+    /// groth proof from it. It returns a groth proof.
+    /// circuit_proof is used internally and should neither be called nor implemented outside of
+    /// default trait methods.
+    fn circuit_proof_mapped(
+        pub_in: &S::PublicInputs,
+        vanilla_proof: &S::Proof,
+        pub_params: &S::PublicParams,
+        groth_params: &groth16::MappedParameters<E>,
+    ) -> Result<groth16::Proof<E>> {
+        let mut rng = OsRng;
+
+        // We need to make the circuit repeatedly because we can't clone it.
+        // Fortunately, doing so is cheap.
+        let make_circuit = || {
+            Self::circuit(
+                &pub_in,
+                C::ComponentPrivateInputs::default(),
+                &vanilla_proof,
+                &pub_params,
+            )
+        };
+
+        let groth_proof = groth16::create_random_proof(make_circuit()?, groth_params, &mut rng)?;
+
+        let mut proof_vec = vec![];
+        groth_proof.write(&mut proof_vec)?;
+        let gp = groth16::Proof::<E>::read(&proof_vec[..])?;
+
+        Ok(gp)
+    }
+
     /// generate_public_inputs generates public inputs suitable for use as input during verification
     /// of a proof generated from this CompoundProof's bellperson::Circuit (C). These inputs correspond
     /// to those allocated when C is synthesized.
@@ -206,6 +289,13 @@ where
         public_params: &S::PublicParams,
     ) -> Result<groth16::Parameters<E>> {
         Self::get_groth_params(rng, Self::blank_circuit(public_params), public_params)
+    }
+
+    fn groth_params_mapped<R: RngCore>(
+        rng: Option<&mut R>,
+        public_params: &S::PublicParams,
+    ) -> Result<groth16::MappedParameters<E>> {
+        Self::get_groth_params_mapped(rng, Self::blank_circuit(public_params), public_params)
     }
 
     fn verifying_key<R: RngCore>(
