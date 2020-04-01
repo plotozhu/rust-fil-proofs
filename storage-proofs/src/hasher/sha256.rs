@@ -1,9 +1,7 @@
-use sha2::{Digest, Sha256};
-
 use std::hash::Hasher as StdHasher;
 
 use anyhow::ensure;
-use bellperson::gadgets::{boolean, multipack, num, sha256::sha256 as sha256_circuit};
+use bellperson::gadgets::{boolean, num, sha256::sha256 as sha256_circuit};
 use bellperson::{ConstraintSystem, SynthesisError};
 use ff::{Field, PrimeField, PrimeFieldRepr};
 use fil_sapling_crypto::jubjub::JubjubEngine;
@@ -12,10 +10,12 @@ use merkletree::merkle::Element;
 use paired::bls12_381::{Bls12, Fr, FrRepr};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::{Domain, HashFunction, Hasher};
 use crate::crypto::sloth;
 use crate::error::*;
+use crate::gadgets::multipack;
 
 #[derive(Default, Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Sha256Hasher {}
@@ -26,10 +26,6 @@ impl Hasher for Sha256Hasher {
 
     fn name() -> String {
         "Sha256Hasher".into()
-    }
-
-    fn create_label(data: &[u8], _m: usize) -> Result<Self::Domain> {
-        Ok(<Self::Function as HashFunction<Self::Domain>>::hash(data))
     }
 
     fn sloth_encode(key: &Self::Domain, ciphertext: &Self::Domain) -> Result<Self::Domain> {
@@ -61,10 +57,14 @@ impl StdHasher for Sha256Function {
     }
 }
 
-#[derive(
-    Copy, Clone, PartialEq, Eq, Debug, PartialOrd, Ord, Default, Serialize, Deserialize, Hash,
-)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize, Hash)]
 pub struct Sha256Domain(pub [u8; 32]);
+
+impl std::fmt::Debug for Sha256Domain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Sha256Domain({})", hex::encode(&self.0))
+    }
+}
 
 impl AsRef<Sha256Domain> for Sha256Domain {
     fn as_ref(&self) -> &Self {
@@ -180,7 +180,41 @@ impl HashFunction<Sha256Domain> for Sha256Function {
         res
     }
 
-    fn hash_leaf_circuit<E: JubjubEngine, CS: ConstraintSystem<E>>(
+    fn hash2(a: &Sha256Domain, b: &Sha256Domain) -> Sha256Domain {
+        let hashed = Sha256::new()
+            .chain(AsRef::<[u8]>::as_ref(a))
+            .chain(AsRef::<[u8]>::as_ref(b))
+            .result();
+        let mut res = Sha256Domain::default();
+        res.0.copy_from_slice(&hashed[..]);
+        res.trim_to_fr32();
+        res
+    }
+
+    fn hash_multi_leaf_circuit<Arity, E: JubjubEngine, CS: ConstraintSystem<E>>(
+        mut cs: CS,
+        leaves: &[num::AllocatedNum<E>],
+        _height: usize,
+        params: &E::Params,
+    ) -> std::result::Result<num::AllocatedNum<E>, SynthesisError> {
+        let mut bits = Vec::with_capacity(leaves.len() * E::Fr::CAPACITY as usize);
+        for (i, leaf) in leaves.iter().enumerate() {
+            let mut padded = leaf.to_bits_le(cs.namespace(|| format!("{}_num_into_bits", i)))?;
+            while padded.len() % 8 != 0 {
+                padded.push(boolean::Boolean::Constant(false));
+            }
+
+            bits.extend(
+                padded
+                    .chunks_exact(8)
+                    .flat_map(|chunk| chunk.iter().rev())
+                    .cloned(),
+            );
+        }
+        Self::hash_circuit(cs, &bits, params)
+    }
+
+    fn hash_leaf_bits_circuit<E: JubjubEngine, CS: ConstraintSystem<E>>(
         cs: CS,
         left: &[boolean::Boolean],
         right: &[boolean::Boolean],
@@ -221,26 +255,57 @@ impl HashFunction<Sha256Domain> for Sha256Function {
         bits: &[boolean::Boolean],
         _params: &E::Params,
     ) -> std::result::Result<num::AllocatedNum<E>, SynthesisError> {
-        let alloc_bits = sha256_circuit(cs.namespace(|| "hash"), &bits[..])?;
-        let fr = if alloc_bits[0].get_value().is_some() {
-            let be_bits = alloc_bits
-                .iter()
-                .map(|v| v.get_value().ok_or(SynthesisError::AssignmentMissing))
-                .collect::<std::result::Result<Vec<bool>, SynthesisError>>()?;
+        let be_bits = sha256_circuit(cs.namespace(|| "hash"), &bits[..])?;
+        let le_bits = be_bits
+            .chunks(8)
+            .flat_map(|chunk| chunk.iter().rev())
+            .cloned()
+            .take(E::Fr::CAPACITY as usize)
+            .collect::<Vec<_>>();
+        multipack::pack_bits(cs.namespace(|| "pack_le"), &le_bits)
+    }
 
-            let le_bits = be_bits
-                .chunks(8)
+    fn hash2_circuit<E, CS>(
+        mut cs: CS,
+        a_num: &num::AllocatedNum<E>,
+        b_num: &num::AllocatedNum<E>,
+        params: &E::Params,
+    ) -> std::result::Result<num::AllocatedNum<E>, SynthesisError>
+    where
+        E: JubjubEngine,
+        CS: ConstraintSystem<E>,
+    {
+        // Allocate as booleans
+        let a = a_num.to_bits_le(cs.namespace(|| "a_bits"))?;
+        let b = b_num.to_bits_le(cs.namespace(|| "b_bits"))?;
+
+        let mut preimage: Vec<boolean::Boolean> = vec![];
+
+        let mut a_padded = a.to_vec();
+        while a_padded.len() % 8 != 0 {
+            a_padded.push(boolean::Boolean::Constant(false));
+        }
+
+        preimage.extend(
+            a_padded
+                .chunks_exact(8)
                 .flat_map(|chunk| chunk.iter().rev())
-                .copied()
-                .take(E::Fr::CAPACITY as usize)
-                .collect::<Vec<bool>>();
+                .cloned(),
+        );
 
-            Ok(multipack::compute_multipacking::<E>(&le_bits)[0])
-        } else {
-            Err(SynthesisError::AssignmentMissing)
-        };
+        let mut b_padded = b.to_vec();
+        while b_padded.len() % 8 != 0 {
+            b_padded.push(boolean::Boolean::Constant(false));
+        }
 
-        num::AllocatedNum::<E>::alloc(cs.namespace(|| "result_num"), || fr)
+        preimage.extend(
+            b_padded
+                .chunks_exact(8)
+                .flat_map(|chunk| chunk.iter().rev())
+                .cloned(),
+        );
+
+        Self::hash_circuit(cs, &preimage[..], params)
     }
 }
 
@@ -268,6 +333,13 @@ impl Algorithm<Sha256Domain> for Sha256Function {
         right.hash(self);
         self.hash()
     }
+
+    fn multi_node(&mut self, parts: &[Sha256Domain], _height: usize) -> Sha256Domain {
+        for part in parts {
+            part.hash(self)
+        }
+        self.hash()
+    }
 }
 
 impl From<[u8; 32]> for Sha256Domain {
@@ -288,9 +360,9 @@ impl From<Sha256Domain> for [u8; 32] {
 mod tests {
     use super::*;
 
-    use crate::circuit::test::TestConstraintSystem;
     use crate::crypto;
     use crate::fr32::fr_into_bytes;
+    use crate::gadgets::TestConstraintSystem;
     use crate::util::bytes_into_boolean_vec;
 
     use bellperson::gadgets::boolean::Boolean;
@@ -302,7 +374,7 @@ mod tests {
     use rand_xorshift::XorShiftRng;
 
     #[test]
-    fn hash_leaf_circuit() {
+    fn hash_leaf_bits_circuit() {
         let mut cs = TestConstraintSystem::<Bls12>::new();
         let rng = &mut XorShiftRng::from_seed(crate::TEST_SEED);
 
@@ -322,7 +394,7 @@ mod tests {
             bytes_into_boolean_vec(&mut cs, Some(right.as_slice()), 256).unwrap()
         };
 
-        let out = Sha256Function::hash_leaf_circuit(
+        let out = Sha256Function::hash_leaf_bits_circuit(
             cs.namespace(|| "hash_leaf_circuit"),
             &left_bits,
             &right_bits,
@@ -332,7 +404,7 @@ mod tests {
         .expect("key derivation function failed");
 
         assert!(cs.is_satisfied(), "constraints not satisfied");
-        assert_eq!(cs.num_constraints(), 45386);
+        assert_eq!(cs.num_constraints(), 45_387);
 
         let expected: Fr = Sha256Function::default()
             .node(left_fr.into(), right_fr.into(), height)

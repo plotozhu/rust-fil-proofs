@@ -1,41 +1,41 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::prelude::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, ensure, Context, Result};
 use bincode::deserialize;
-use log::info;
-use merkletree::merkle::{get_merkle_tree_leafs, MerkleTree};
-use merkletree::store::{DiskStore, Store, StoreConfig, DEFAULT_CACHED_ABOVE_BASE_LAYER};
+use log::{info, trace};
+use merkletree::merkle::get_merkle_tree_leafs;
+use merkletree::store::{ExternalReader, LevelCacheStore, StoreConfig};
 use paired::bls12_381::Bls12;
 use rayon::prelude::*;
-use storage_proofs::circuit::election_post::ElectionPoStCompound;
-use storage_proofs::circuit::multi_proof::MultiProof;
+use storage_proofs::cache_key::CacheKey;
 use storage_proofs::compound_proof::{self, CompoundProof};
-use storage_proofs::drgraph::DefaultTreeHasher;
-use storage_proofs::election_post;
 use storage_proofs::fr32::bytes_into_fr;
 use storage_proofs::hasher::Hasher;
+use storage_proofs::merkle::OctLCMerkleTree;
+use storage_proofs::multi_proof::MultiProof;
+use storage_proofs::post::election;
+pub use storage_proofs::post::election::Candidate;
+use storage_proofs::post::election::ElectionPoStCompound;
 use storage_proofs::proof::NoRequirements;
 use storage_proofs::sector::*;
-use storage_proofs::stacked::CacheKey;
 
-use crate::api::util::as_safe_commitment;
+use crate::api::util::{as_safe_commitment, get_tree_size};
 use crate::caches::{get_post_params, get_post_verifying_key};
+use crate::constants::DefaultTreeHasher;
 use crate::parameters::post_setup_params;
 use crate::types::{
-    ChallengeSeed, Commitment, PersistentAux, PoStConfig, ProverId, SectorSize, Tree,
+    ChallengeSeed, Commitment, LCTree, PersistentAux, PoStConfig, ProverId, TemporaryAux, OCT_ARITY,
 };
-
-pub use storage_proofs::election_post::Candidate;
 
 /// The minimal information required about a replica, in order to be able to generate
 /// a PoSt over it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PrivateReplicaInfo {
     /// Path to the replica.
-    access: String,
+    replica: PathBuf,
     /// The replica commitment.
     comm_r: Commitment,
     /// Persistent Aux.
@@ -57,7 +57,7 @@ impl std::cmp::PartialOrd for PrivateReplicaInfo {
 }
 
 impl PrivateReplicaInfo {
-    pub fn new(access: String, comm_r: Commitment, cache_dir: PathBuf) -> Result<Self> {
+    pub fn new(replica: PathBuf, comm_r: Commitment, cache_dir: PathBuf) -> Result<Self> {
         ensure!(comm_r != [0; 32], "Invalid all zero commitment (comm_r)");
 
         let aux = {
@@ -72,12 +72,22 @@ impl PrivateReplicaInfo {
             deserialize(&aux_bytes)
         }?;
 
+        ensure!(replica.exists(), "Sealed replica does not exist");
+
         Ok(PrivateReplicaInfo {
-            access,
+            replica,
             comm_r,
             aux,
             cache_dir,
         })
+    }
+
+    pub fn cache_dir_path(&self) -> &Path {
+        self.cache_dir.as_path()
+    }
+
+    pub fn replica_path(&self) -> &Path {
+        self.replica.as_path()
     }
 
     pub fn safe_comm_r(&self) -> Result<<DefaultTreeHasher as Hasher>::Domain> {
@@ -88,25 +98,33 @@ impl PrivateReplicaInfo {
         Ok(self.aux.comm_c)
     }
 
-    pub fn safe_comm_q(&self) -> Result<<DefaultTreeHasher as Hasher>::Domain> {
-        Ok(self.aux.comm_q)
-    }
-
     pub fn safe_comm_r_last(&self) -> Result<<DefaultTreeHasher as Hasher>::Domain> {
         Ok(self.aux.comm_r_last)
     }
 
     /// Generate the merkle tree of this particular replica.
-    pub fn merkle_tree(&self, tree_size: usize, tree_leafs: usize) -> Result<Tree> {
+    pub fn merkle_tree(&self, tree_size: usize, tree_leafs: usize) -> Result<LCTree> {
+        trace!(
+            "post: tree size {}, tree leafs {}, cached above base {}",
+            tree_size,
+            tree_leafs,
+            StoreConfig::default_cached_above_base_layer(tree_leafs, OCT_ARITY)
+        );
         let mut config = StoreConfig::new(
-            &self.cache_dir,
+            self.cache_dir_path(),
             CacheKey::CommRLastTree.to_string(),
-            DEFAULT_CACHED_ABOVE_BASE_LAYER,
+            StoreConfig::default_cached_above_base_layer(tree_leafs, OCT_ARITY),
         );
         config.size = Some(tree_size);
-        let tree_r_last_store: DiskStore<<DefaultTreeHasher as Hasher>::Domain> =
-            DiskStore::new_from_disk(tree_size, &config)?;
-        let tree_r_last: Tree = MerkleTree::from_data_store(tree_r_last_store, tree_leafs)?;
+
+        let tree_r_last_store: LevelCacheStore<<DefaultTreeHasher as Hasher>::Domain, _> =
+            LevelCacheStore::new_from_disk_with_reader(
+                tree_size,
+                OCT_ARITY,
+                &config,
+                ExternalReader::new_from_path(&self.replica_path().to_path_buf())?,
+            )?;
+        let tree_r_last = OctLCMerkleTree::from_data_store(tree_r_last_store, tree_leafs)?;
 
         Ok(tree_r_last)
     }
@@ -143,11 +161,30 @@ impl PublicReplicaInfo {
     }
 }
 
-fn get_tree_size(sector_size: SectorSize) -> usize {
-    let sector_size = u64::from(sector_size);
-    let elems = sector_size as usize / std::mem::size_of::<<DefaultTreeHasher as Hasher>::Domain>();
+// Ensure that any associated cached data persisted is discarded.
+pub fn clear_cache(cache_dir: &Path) -> Result<()> {
+    let t_aux = {
+        let mut aux_bytes = vec![];
+        let f_aux_path = cache_dir.to_path_buf().join(CacheKey::TAux.to_string());
+        let mut f_aux = File::open(&f_aux_path)
+            .with_context(|| format!("could not open path={:?}", f_aux_path))?;
+        f_aux
+            .read_to_end(&mut aux_bytes)
+            .with_context(|| format!("could not read from path={:?}", f_aux_path))?;
 
-    2 * elems - 1
+        deserialize(&aux_bytes)
+    }?;
+
+    TemporaryAux::clear_temp(t_aux)
+}
+
+// Ensure that any associated cached data persisted is discarded.
+pub fn clear_caches(replicas: &BTreeMap<SectorId, PrivateReplicaInfo>) -> Result<()> {
+    for replica in replicas.values() {
+        clear_cache(replica.cache_dir_path())?;
+    }
+
+    Ok(())
 }
 
 /// Generates proof-of-spacetime candidates for ElectionPoSt.
@@ -169,14 +206,20 @@ pub fn generate_candidates(
 ) -> Result<Vec<Candidate>> {
     info!("generate_candidates:start");
 
+    ensure!(!replicas.is_empty(), "Replicas must not be empty");
+    ensure!(challenge_count > 0, "Challenge count must be > 0");
+
+    let randomness_safe = as_safe_commitment(randomness, "randomness")?;
+    let prover_id_safe = as_safe_commitment(&prover_id, "randomness")?;
+
     let vanilla_params = post_setup_params(post_config);
     let setup_params = compound_proof::SetupParams {
         vanilla_params,
         partitions: None,
+        priority: false,
     };
-    let public_params: compound_proof::PublicParams<
-        election_post::ElectionPoSt<DefaultTreeHasher>,
-    > = ElectionPoStCompound::setup(&setup_params)?;
+    let public_params: compound_proof::PublicParams<election::ElectionPoSt<DefaultTreeHasher>> =
+        ElectionPoStCompound::setup(&setup_params)?;
 
     let sector_count = replicas.len() as u64;
     ensure!(sector_count > 0, "Must supply at least one replica");
@@ -184,7 +227,7 @@ pub fn generate_candidates(
     let sectors = replicas.keys().copied().collect();
 
     let challenged_sectors =
-        election_post::generate_sector_challenges(randomness, challenge_count, &sectors)?;
+        election::generate_sector_challenges(randomness_safe, challenge_count, &sectors)?;
 
     // Match the replicas to the challenges, as these are the only ones required.
     let challenged_replicas: Vec<_> = challenged_sectors
@@ -210,8 +253,9 @@ pub fn generate_candidates(
     unique_challenged_replicas.sort_unstable(); // dedup requires a sorted list
     unique_challenged_replicas.dedup();
 
-    let tree_size = get_tree_size(post_config.sector_size);
-    let tree_leafs = get_merkle_tree_leafs(tree_size);
+    let tree_size =
+        get_tree_size::<<DefaultTreeHasher as Hasher>::Domain>(post_config.sector_size, OCT_ARITY)?;
+    let tree_leafs = get_merkle_tree_leafs(tree_size, OCT_ARITY);
 
     let unique_trees_res: Vec<_> = unique_challenged_replicas
         .into_par_iter()
@@ -223,14 +267,15 @@ pub fn generate_candidates(
         .collect();
 
     // resolve results
-    let trees: BTreeMap<SectorId, Tree> = unique_trees_res.into_iter().collect::<Result<_, _>>()?;
+    let trees: BTreeMap<SectorId, LCTree> =
+        unique_trees_res.into_iter().collect::<Result<_, _>>()?;
 
-    let candidates = election_post::generate_candidates::<DefaultTreeHasher>(
-        public_params.vanilla_params.sector_size,
+    let candidates = election::generate_candidates::<DefaultTreeHasher>(
+        &public_params.vanilla_params,
         &challenged_sectors,
         &trees,
-        &prover_id,
-        randomness,
+        prover_id_safe,
+        randomness_safe,
     )?;
 
     info!("generate_candidates:finish");
@@ -244,7 +289,7 @@ pub type SnarkProof = Vec<u8>;
 pub fn finalize_ticket(partial_ticket: &[u8; 32]) -> Result<[u8; 32]> {
     let partial_ticket =
         bytes_into_fr::<Bls12>(partial_ticket).context("Invalid partial_ticket")?;
-    Ok(election_post::finalize_ticket(&partial_ticket))
+    Ok(election::finalize_ticket(&partial_ticket))
 }
 
 /// Generates a proof-of-spacetime.
@@ -268,18 +313,25 @@ pub fn generate_post(
 
     let sector_count = replicas.len() as u64;
     ensure!(sector_count > 0, "Must supply at least one replica");
+    ensure!(!winners.is_empty(), "Winners must not be empty");
+    ensure!(!replicas.is_empty(), "Replicas must not be empty");
+
+    let randomness_safe = as_safe_commitment(randomness, "randomness")?;
+    let prover_id_safe = as_safe_commitment(&prover_id, "randomness")?;
 
     let vanilla_params = post_setup_params(post_config);
     let setup_params = compound_proof::SetupParams {
         vanilla_params,
         partitions: None,
+        priority: post_config.priority,
     };
-    let pub_params: compound_proof::PublicParams<election_post::ElectionPoSt<DefaultTreeHasher>> =
+    let pub_params: compound_proof::PublicParams<election::ElectionPoSt<DefaultTreeHasher>> =
         ElectionPoStCompound::setup(&setup_params)?;
     let groth_params = get_post_params(post_config)?;
 
-    let tree_size = get_tree_size(post_config.sector_size);
-    let tree_leafs = get_merkle_tree_leafs(tree_size);
+    let tree_size =
+        get_tree_size::<<DefaultTreeHasher as Hasher>::Domain>(post_config.sector_size, OCT_ARITY)?;
+    let tree_leafs = get_merkle_tree_leafs(tree_size, OCT_ARITY);
 
     let mut proofs = Vec::with_capacity(winners.len());
 
@@ -292,22 +344,20 @@ pub fn generate_post(
             let tree = replica.merkle_tree(tree_size, tree_leafs)?;
 
             let comm_r = replica.safe_comm_r()?;
-            let pub_inputs = election_post::PublicInputs {
-                randomness: *randomness,
+            let pub_inputs = election::PublicInputs {
+                randomness: randomness_safe,
                 comm_r,
                 sector_id: winner.sector_id,
                 partial_ticket: winner.partial_ticket,
                 sector_challenge_index: winner.sector_challenge_index,
-                prover_id,
+                prover_id: prover_id_safe,
             };
 
             let comm_c = replica.safe_comm_c()?;
-            let comm_q = replica.safe_comm_q()?;
             let comm_r_last = replica.safe_comm_r_last()?;
-            let priv_inputs = election_post::PrivateInputs::<DefaultTreeHasher> {
+            let priv_inputs = election::PrivateInputs::<DefaultTreeHasher> {
                 tree,
                 comm_c,
-                comm_q,
                 comm_r_last,
             };
 
@@ -349,38 +399,60 @@ pub fn verify_post(
 ) -> Result<bool> {
     info!("verify_post:start");
 
+    let mut challenge_indexes: HashSet<_> = HashSet::new();
+
+    // Fail early if any sector_challenge_index is duplicated.
+    for winner in winners.iter() {
+        if challenge_indexes.contains(&winner.sector_challenge_index) {
+            return Err(anyhow!(
+                "Invalid PoSt claiming duplicate sector_challenge_index: {}",
+                &winner.sector_challenge_index
+            ));
+        } else {
+            challenge_indexes.insert(&winner.sector_challenge_index);
+        };
+    }
+
     let sector_count = replicas.len() as u64;
     ensure!(sector_count > 0, "Must supply at least one replica");
+    ensure!(!winners.is_empty(), "Winners must not be empty");
+    ensure!(!proofs.is_empty(), "Proofs must not be empty");
+    ensure!(!replicas.is_empty(), "Replicas must not be empty");
     ensure!(
         winners.len() == proofs.len(),
-        "Missmatch between winners and proofs"
+        "Mismatch between winners and proofs"
     );
+
+    let randomness_safe = as_safe_commitment(randomness, "randomness")?;
+    let prover_id_safe = as_safe_commitment(&prover_id, "randomness")?;
 
     let sectors = replicas.keys().copied().collect();
     let vanilla_params = post_setup_params(post_config);
     let setup_params = compound_proof::SetupParams {
         vanilla_params,
         partitions: None,
+        priority: false,
     };
-    let pub_params: compound_proof::PublicParams<election_post::ElectionPoSt<DefaultTreeHasher>> =
+    let pub_params: compound_proof::PublicParams<election::ElectionPoSt<DefaultTreeHasher>> =
         ElectionPoStCompound::setup(&setup_params)?;
 
     let verifying_key = get_post_verifying_key(post_config)?;
+
     for (proof, winner) in proofs.iter().zip(winners.iter()) {
         let replica = replicas
             .get(&winner.sector_id)
             .with_context(|| format!("Missing replica for sector: {}", winner.sector_id))?;
         let comm_r = replica.safe_comm_r()?;
 
-        if !election_post::is_valid_sector_challenge_index(
+        if !election::is_valid_sector_challenge_index(
             challenge_count,
             winner.sector_challenge_index,
         ) {
             return Ok(false);
         }
 
-        let expected_sector_id = election_post::generate_sector_challenge(
-            randomness,
+        let expected_sector_id = election::generate_sector_challenge(
+            randomness_safe,
             winner.sector_challenge_index as usize,
             &sectors,
         )?;
@@ -389,13 +461,13 @@ pub fn verify_post(
         }
 
         let proof = MultiProof::new_from_reader(None, &proof[..], &verifying_key)?;
-        let pub_inputs = election_post::PublicInputs {
-            randomness: *randomness,
+        let pub_inputs = election::PublicInputs {
+            randomness: randomness_safe,
             comm_r,
             sector_id: winner.sector_id,
             partial_ticket: winner.partial_ticket,
             sector_challenge_index: winner.sector_challenge_index,
-            prover_id,
+            prover_id: prover_id_safe,
         };
 
         let is_valid =

@@ -14,10 +14,9 @@ use std::env;
 use std::fs::{self, create_dir_all, File};
 use std::io::{self, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 /// Bump this when circuits change to invalidate the cache.
-pub const VERSION: usize = 20;
+pub const VERSION: usize = 24;
 
 pub const PARAMETER_CACHE_ENV_VAR: &str = "FIL_PROOFS_PARAMETER_CACHE";
 pub const PARAMETER_CACHE_DIR: &str = "/var/tmp/filecoin-proof-parameters/";
@@ -28,7 +27,7 @@ pub const VERIFYING_KEY_EXT: &str = "vk";
 #[derive(Debug)]
 struct LockedFile(File);
 
-// TODO: use in memory lock as well, as file locks do not guarantee exclusive access acros OSes.
+// TODO: use in memory lock as well, as file locks do not guarantee exclusive access across OSes.
 
 impl LockedFile {
     pub fn open_exclusive_read<P: AsRef<Path>>(p: P) -> io::Result<Self> {
@@ -181,15 +180,22 @@ where
             .or_else(|_| write_cached_metadata(&meta_path, Self::cache_meta(pub_params)))
     }
 
+    /// If the rng option argument is set, parameters will be
+    /// generated using it.  This is used for testing only, or where
+    /// parameters are otherwise unavailable (e.g. benches).  If rng
+    /// is not set, an error will result if parameters are not
+    /// present.
     fn get_groth_params<R: RngCore>(
         rng: Option<&mut R>,
         circuit: C,
         pub_params: &P,
-    ) -> Result<groth16::Parameters<E>> {
+    ) -> Result<groth16::MappedParameters<E>> {
         let id = Self::cache_identifier(pub_params);
 
         let generate = || -> Result<_> {
             if let Some(rng) = rng {
+                use std::time::Instant;
+
                 info!("Actually generating groth params. (id: {})", &id);
                 let start = Instant::now();
                 let parameters = groth16::generate_random_parameters::<E, _, _>(circuit, rng)?;
@@ -204,11 +210,24 @@ where
             }
         };
 
-        // generate (or load) Groth parameters
+        // load or generate Groth parameter mappings
         let cache_path = ensure_ancestor_dirs_exist(parameter_cache_params_path(&id))?;
-        read_cached_params(&cache_path).or_else(|_| write_cached_params(&cache_path, generate()?))
+        match read_cached_params(&cache_path) {
+            Ok(x) => Ok(x),
+            Err(_) => {
+                write_cached_params(&cache_path, generate()?).unwrap_or_else(|e| {
+                    panic!("{}: failed to write generated parameters to cache", e)
+                });
+                Ok(read_cached_params(&cache_path)?)
+            }
+        }
     }
 
+    /// If the rng option argument is set, parameters will be
+    /// generated using it.  This is used for testing only, or where
+    /// parameters are otherwise unavailable (e.g. benches).  If rng
+    /// is not set, an error will result if parameters are not
+    /// present.
     fn get_verifying_key<R: RngCore>(
         rng: Option<&mut R>,
         circuit: C,
@@ -239,12 +258,14 @@ fn ensure_parent(path: &PathBuf) -> Result<()> {
     }
 }
 
+// Reads parameter mappings using mmap so that they can be lazily
+// loaded later.
 fn read_cached_params<E: JubjubEngine>(
     cache_entry_path: &PathBuf,
-) -> Result<groth16::Parameters<E>> {
+) -> Result<groth16::MappedParameters<E>> {
     info!("checking cache_path: {:?} for parameters", cache_entry_path);
-    with_exclusive_read_lock(cache_entry_path, |mut f| {
-        let params = Parameters::read(&mut f, false)?;
+    with_exclusive_read_lock(cache_entry_path, |_| {
+        let params = Parameters::build_mapped_parameters(cache_entry_path.to_path_buf(), false)?;
         info!("read parameters from cache {:?} ", cache_entry_path);
 
         Ok(params)

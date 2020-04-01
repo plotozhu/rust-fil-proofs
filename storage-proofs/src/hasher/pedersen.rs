@@ -12,9 +12,9 @@ use merkletree::merkle::Element;
 use paired::bls12_381::{Bls12, Fr, FrRepr};
 use serde::{Deserialize, Serialize};
 
-use crate::circuit::pedersen::pedersen_md_no_padding;
-use crate::crypto::{create_label, pedersen, sloth};
+use crate::crypto::{pedersen, sloth};
 use crate::error::{Error, Result};
+use crate::gadgets::pedersen::{pedersen_compression_num, pedersen_md_no_padding};
 use crate::hasher::{Domain, HashFunction, Hasher};
 
 #[derive(Default, Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,10 +26,6 @@ impl Hasher for PedersenHasher {
 
     fn name() -> String {
         "PedersenHasher".into()
-    }
-
-    fn create_label(data: &[u8], m: usize) -> Result<Self::Domain> {
-        Ok(create_label::create_label(data, m)?.into())
     }
 
     #[inline]
@@ -183,10 +179,7 @@ impl Element for PedersenDomain {
     }
 
     fn from_slice(bytes: &[u8]) -> Self {
-        match PedersenDomain::try_from_bytes(bytes) {
-            Ok(res) => res,
-            Err(err) => panic!(err),
-        }
+        PedersenDomain::try_from_bytes(bytes).expect("invalid bytes")
     }
 
     fn copy_to_slice(&self, bytes: &mut [u8]) {
@@ -211,7 +204,55 @@ impl HashFunction<PedersenDomain> for PedersenFunction {
         pedersen::pedersen_md_no_padding(data).into()
     }
 
-    fn hash_leaf_circuit<E: JubjubEngine, CS: ConstraintSystem<E>>(
+    fn hash2(a: &PedersenDomain, b: &PedersenDomain) -> PedersenDomain {
+        let data = NodeBits::new(&(a.0).0[..], &(b.0).0[..]);
+
+        let digest = if cfg!(target_arch = "x86_64") {
+            use fil_sapling_crypto::pedersen_hash::pedersen_hash_bls12_381_with_precomp;
+            pedersen_hash_bls12_381_with_precomp::<_>(
+                Personalization::None,
+                data,
+                &pedersen::JJ_PARAMS,
+            )
+        } else {
+            use fil_sapling_crypto::pedersen_hash::pedersen_hash;
+            pedersen_hash::<Bls12, _>(Personalization::None, data, &pedersen::JJ_PARAMS)
+        };
+        digest.into_xy().0.into()
+    }
+
+    fn hash_multi_leaf_circuit<Arity, E: JubjubEngine, CS: ConstraintSystem<E>>(
+        mut cs: CS,
+        leaves: &[num::AllocatedNum<E>],
+        _height: usize,
+        params: &E::Params,
+    ) -> std::result::Result<num::AllocatedNum<E>, SynthesisError> {
+        let is_binary = leaves.len() == 2;
+
+        let mut bits = Vec::with_capacity(leaves.len() * E::Fr::CAPACITY as usize);
+        for (i, leaf) in leaves.iter().enumerate() {
+            bits.extend_from_slice(
+                &leaf.to_bits_le(cs.namespace(|| format!("{}_num_into_bits", i)))?,
+            );
+            if !is_binary {
+                while bits.len() % 8 != 0 {
+                    bits.push(boolean::Boolean::Constant(false));
+                }
+            }
+        }
+
+        if is_binary {
+            Ok(
+                pedersen_hash_circuit::pedersen_hash(cs, Personalization::None, &bits, params)?
+                    .get_x()
+                    .clone(),
+            )
+        } else {
+            Self::hash_circuit(cs, &bits, params)
+        }
+    }
+
+    fn hash_leaf_bits_circuit<E: JubjubEngine, CS: ConstraintSystem<E>>(
         cs: CS,
         left: &[boolean::Boolean],
         right: &[boolean::Boolean],
@@ -235,6 +276,32 @@ impl HashFunction<PedersenDomain> for PedersenFunction {
         params: &E::Params,
     ) -> std::result::Result<num::AllocatedNum<E>, SynthesisError> {
         pedersen_md_no_padding(cs, params, bits)
+    }
+
+    fn hash2_circuit<E, CS>(
+        mut cs: CS,
+        a_num: &num::AllocatedNum<E>,
+        b_num: &num::AllocatedNum<E>,
+        params: &E::Params,
+    ) -> std::result::Result<num::AllocatedNum<E>, SynthesisError>
+    where
+        E: JubjubEngine,
+        CS: ConstraintSystem<E>,
+    {
+        // Allocate as booleans
+        let a = a_num.to_bits_le(cs.namespace(|| "a_bits"))?;
+        let b = b_num.to_bits_le(cs.namespace(|| "b_bits"))?;
+
+        let mut values = Vec::new();
+        values.extend_from_slice(&a);
+        values.extend_from_slice(&b);
+
+        if values.is_empty() {
+            // can happen with small layers
+            num::AllocatedNum::alloc(cs.namespace(|| "pedersen_hash1"), || Ok(E::Fr::zero()))
+        } else {
+            pedersen_compression_num(cs.namespace(|| "pedersen_hash1"), params, &values)
+        }
     }
 }
 
@@ -274,6 +341,17 @@ impl LightAlgorithm<PedersenDomain> for PedersenFunction {
         };
 
         digest.into_xy().0.into()
+    }
+
+    fn multi_node(&mut self, parts: &[PedersenDomain], height: usize) -> PedersenDomain {
+        match parts.len() {
+            2 => self.node(parts[0], parts[1], height),
+            _ => {
+                use crate::crypto::pedersen::*;
+
+                pedersen_md_no_padding_bits(Bits::new_many(parts.iter())).into()
+            }
+        }
     }
 }
 
@@ -347,23 +425,29 @@ mod tests {
 
     use merkletree::hash::Hashable;
 
-    use crate::merkle::MerkleTree;
+    use crate::merkle::BinaryMerkleTree;
 
     #[test]
     fn test_path() {
         let values = ["hello", "world", "you", "two"];
-        let t = MerkleTree::<PedersenDomain, PedersenFunction>::from_data(values.iter()).unwrap();
+        let t =
+            BinaryMerkleTree::<PedersenDomain, PedersenFunction>::from_data(values.iter()).unwrap();
 
         let p = t.gen_proof(0).unwrap(); // create a proof for the first value = "hello"
-        assert_eq!(*p.path(), vec![true, true]);
-        assert_eq!(p.validate::<PedersenFunction>(), true);
+        assert_eq!(*p.path(), vec![0, 0]);
+        assert_eq!(
+            p.validate::<PedersenFunction>()
+                .expect("failed to validate"),
+            true
+        );
     }
 
     #[test]
     fn test_pedersen_hasher() {
         let values = ["hello", "world", "you", "two"];
 
-        let t = MerkleTree::<PedersenDomain, PedersenFunction>::from_data(values.iter()).unwrap();
+        let t =
+            BinaryMerkleTree::<PedersenDomain, PedersenFunction>::from_data(values.iter()).unwrap();
 
         assert_eq!(t.leafs(), 4);
 

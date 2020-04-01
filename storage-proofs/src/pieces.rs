@@ -1,12 +1,12 @@
 use std::io::Read;
 
-use anyhow::ensure;
+use anyhow::{ensure, Context};
 use merkletree::merkle::next_pow2;
 
 use crate::error::*;
 use crate::fr32::Fr32Ary;
 use crate::hasher::{Domain, Hasher};
-use crate::merkle::MerkleTree;
+use crate::merkle::BinaryMerkleTree;
 use crate::util::NODE_SIZE;
 
 /// `position`, `length` are in H::Domain units
@@ -52,16 +52,14 @@ pub fn generate_piece_commitment_bytes_from_source<H: Hasher>(
     ensure!(padded_piece_size % 32 == 0, "piece is not valid size");
 
     let mut buf = [0; NODE_SIZE];
-    use std::io::BufReader;
-
-    let mut reader = BufReader::new(source);
 
     let parts = (padded_piece_size as f64 / NODE_SIZE as f64).ceil() as usize;
 
-    let tree = MerkleTree::<H::Domain, H::Function>::try_from_iter((0..parts).map(|_| {
-        reader.read_exact(&mut buf)?;
-        <H::Domain as Domain>::try_from_bytes(&buf)
-    }))?;
+    let tree = BinaryMerkleTree::<H::Domain, H::Function>::try_from_iter((0..parts).map(|_| {
+        source.read_exact(&mut buf)?;
+        <H::Domain as Domain>::try_from_bytes(&buf).context("invalid Fr element")
+    }))
+    .context("failed to build tree")?;
 
     let mut comm_p_bytes = [0; NODE_SIZE];
     let comm_p = tree.root();

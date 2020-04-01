@@ -13,9 +13,8 @@ use pbr::ProgressBar;
 use rand::{Rng, SeedableRng};
 use rand_xorshift::XorShiftRng;
 
-use crate::circuit::bench::BenchCS;
-use crate::circuit::test::TestConstraintSystem;
 use crate::crypto::pedersen::JJ_PARAMS;
+use crate::gadgets::{BenchCS, TestConstraintSystem};
 
 pub fn prettyb(num: usize) -> String {
     let num = num as f64;
@@ -58,7 +57,7 @@ pub enum CSType {
 }
 
 /// A trait that makes it easy to implement "Examples". These are really tunable benchmarking CLI tools.
-pub trait Example<'a, C: Circuit<Bls12>>: Default {
+pub trait Example<'a, C: Circuit<Bls12> + Send>: Default {
     /// The actual work.
     fn work_groth(&mut self, typ: CSType, data_size: usize, challenge_count: usize, m: usize) {
         let rng = &mut XorShiftRng::from_seed(crate::TEST_SEED);

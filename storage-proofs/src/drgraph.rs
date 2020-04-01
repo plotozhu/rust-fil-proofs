@@ -1,21 +1,22 @@
 use std::cmp;
 use std::marker::PhantomData;
+use std::path::PathBuf;
 
 use anyhow::ensure;
+use generic_array::typenum;
+use merkletree::store::StoreConfig;
 use rand::{rngs::OsRng, Rng, SeedableRng};
 use rand_chacha::ChaChaRng;
 use sha2::{Digest, Sha256};
 
 use crate::error::*;
 use crate::fr32::bytes_into_fr_repr_safe;
-use crate::hasher::pedersen::PedersenHasher;
 use crate::hasher::Hasher;
-use crate::merkle::{create_merkle_tree, MerkleTree};
+use crate::merkle::{
+    create_lcmerkle_tree, create_merkle_tree, open_lcmerkle_tree, LCMerkleTree, MerkleTree,
+};
 use crate::parameter_cache::ParameterSetMetadata;
 use crate::util::{data_at_node_offset, NODE_SIZE};
-
-/// The default hasher currently in use.
-pub type DefaultTreeHasher = PedersenHasher;
 
 pub const PARALLEL_MERKLE: bool = true;
 
@@ -34,13 +35,38 @@ pub trait Graph<H: Hasher>: ::std::fmt::Debug + Clone + PartialEq + Eq {
     }
 
     /// Builds a merkle tree based on the given data.
-    fn merkle_tree<'a>(&self, data: &'a [u8]) -> Result<MerkleTree<H::Domain, H::Function>> {
-        create_merkle_tree::<H>(None, self.size(), data)
+    fn merkle_tree<'a, U: typenum::Unsigned>(
+        &self,
+        config: Option<StoreConfig>,
+        data: &'a [u8],
+    ) -> Result<MerkleTree<H::Domain, H::Function, U>> {
+        create_merkle_tree::<H, U>(config, self.size(), data)
+    }
+
+    /// Builds a merkle tree based on the given data and level cache
+    /// data.
+    fn lcmerkle_tree<'a, U: typenum::Unsigned>(
+        &self,
+        config: StoreConfig,
+        data: &'a [u8],
+        replica_path: &PathBuf,
+    ) -> Result<LCMerkleTree<H::Domain, H::Function, U>> {
+        create_lcmerkle_tree::<H, U>(config, self.size(), data, replica_path)
+    }
+
+    /// Returns a merkle tree based on the given config, replica and
+    /// level cache data.
+    fn lcmerkle_open<U: typenum::Unsigned>(
+        &self,
+        config: StoreConfig,
+        replica_path: &PathBuf,
+    ) -> Result<LCMerkleTree<H::Domain, H::Function, U>> {
+        open_lcmerkle_tree::<H, U>(config, self.size(), replica_path)
     }
 
     /// Returns the merkle tree depth.
-    fn merkle_tree_depth(&self) -> u64 {
-        graph_height(self.size()) as u64
+    fn merkle_tree_depth<U: typenum::Unsigned>(&self) -> u64 {
+        graph_height::<U>(self.size()) as u64
     }
 
     /// Returns a sorted list of all parents of this node. The parents may be repeated.
@@ -79,8 +105,8 @@ pub trait Graph<H: Hasher>: ::std::fmt::Debug + Clone + PartialEq + Eq {
     ) -> Result<Self::Key>;
 }
 
-pub fn graph_height(size: usize) -> usize {
-    (size as f64).log2().ceil() as usize
+pub fn graph_height<U: typenum::Unsigned>(number_of_leafs: usize) -> usize {
+    merkletree::merkle::get_merkle_tree_height(number_of_leafs, U::to_usize())
 }
 
 /// Bucket sampling algorithm.
@@ -209,10 +235,6 @@ impl<H: Hasher> Graph<H> for BucketGraph<H> {
         expansion_degree: usize,
         seed: [u8; 28],
     ) -> Result<Self> {
-        if !cfg!(feature = "unchecked-degrees") {
-            ensure!(base_degree == BASE_DEGREE, "Base degree is wrong.");
-        }
-
         ensure!(expansion_degree == 0, "Expension degree must be zero.");
 
         Ok(BucketGraph {
@@ -236,7 +258,7 @@ mod tests {
     use memmap::MmapOptions;
 
     use crate::drgraph::new_seed;
-    use crate::hasher::{Blake2sHasher, PedersenHasher, Sha256Hasher};
+    use crate::hasher::{Blake2sHasher, PedersenHasher, PoseidonHasher, Sha256Hasher};
 
     // Create and return an object of MmapMut backed by in-memory copy of data.
     pub fn mmap_from(data: &[u8]) -> MmapMut {
@@ -251,7 +273,7 @@ mod tests {
     fn graph_bucket<H: Hasher>() {
         let degree = BASE_DEGREE;
 
-        for size in vec![3, 10, 200, 2000] {
+        for size in vec![4, 16, 256, 2048] {
             let g = BucketGraph::<H>::new(size, degree, 0, new_seed()).unwrap();
 
             assert_eq!(g.size(), size, "wrong nodes count");
@@ -300,29 +322,65 @@ mod tests {
         graph_bucket::<PedersenHasher>();
     }
 
-    fn gen_proof<H: Hasher>() {
-        let g = BucketGraph::<H>::new(5, BASE_DEGREE, 0, new_seed()).unwrap();
-        let data = vec![2u8; NODE_SIZE * 5];
+    fn gen_proof<H: Hasher, U: typenum::Unsigned>(config: Option<StoreConfig>) {
+        let leafs = 64;
+        let g = BucketGraph::<H>::new(leafs, BASE_DEGREE, 0, new_seed()).unwrap();
+        let data = vec![2u8; NODE_SIZE * leafs];
 
         let mmapped = &mmap_from(&data);
-        let tree = g.merkle_tree(mmapped).unwrap();
+        let tree = g.merkle_tree::<U>(config, mmapped).unwrap();
         let proof = tree.gen_proof(2).unwrap();
 
-        assert!(proof.validate::<H::Function>());
+        assert!(proof.validate::<H::Function>().expect("failed to validate"));
     }
 
     #[test]
-    fn gen_proof_pedersen() {
-        gen_proof::<PedersenHasher>();
+    fn gen_proof_pedersen_binary() {
+        gen_proof::<PedersenHasher, typenum::U2>(None);
     }
 
     #[test]
-    fn gen_proof_sha256() {
-        gen_proof::<Sha256Hasher>();
+    fn gen_proof_poseidon_binary() {
+        gen_proof::<PoseidonHasher, typenum::U2>(None);
     }
 
     #[test]
-    fn gen_proof_blake2s() {
-        gen_proof::<Blake2sHasher>();
+    fn gen_proof_sha256_binary() {
+        gen_proof::<Sha256Hasher, typenum::U2>(None);
+    }
+
+    #[test]
+    fn gen_proof_blake2s_binary() {
+        gen_proof::<Blake2sHasher, typenum::U2>(None);
+    }
+
+    #[test]
+    fn gen_proof_pedersen_quad() {
+        gen_proof::<PedersenHasher, typenum::U4>(None);
+    }
+
+    #[test]
+    fn gen_proof_poseidon_quad() {
+        gen_proof::<PoseidonHasher, typenum::U4>(None);
+    }
+
+    #[test]
+    fn gen_proof_sha256_quad() {
+        gen_proof::<Sha256Hasher, typenum::U4>(None);
+    }
+
+    #[test]
+    fn gen_proof_blake2s_quad() {
+        gen_proof::<Blake2sHasher, typenum::U4>(None);
+    }
+
+    #[test]
+    fn gen_proof_pedersen_oct() {
+        gen_proof::<PedersenHasher, typenum::U8>(None);
+    }
+
+    #[test]
+    fn gen_proof_poseidon_oct() {
+        gen_proof::<PoseidonHasher, typenum::U8>(None);
     }
 }

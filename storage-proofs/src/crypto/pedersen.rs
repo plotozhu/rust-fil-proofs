@@ -83,7 +83,7 @@ where
 
 #[derive(Debug, Clone)]
 pub struct Hasher {
-    curr: [u8; 32],
+    curr: Option<[u8; 32]>,
 }
 
 impl Hasher {
@@ -92,28 +92,41 @@ impl Hasher {
         let mut curr = [0u8; 32];
         curr.copy_from_slice(data);
 
-        Ok(Hasher { curr })
+        Ok(Hasher { curr: Some(curr) })
+    }
+
+    pub fn new_empty() -> Self {
+        Hasher { curr: None }
     }
 
     pub fn update(&mut self, data: &[u8]) -> Result<()> {
         ensure!(data.len() == 32, "Data must be 32 bytes.");
 
-        let parts = [&self.curr, data];
-        let data = Bits::new_many(parts.iter());
-        let x = pedersen_compression_bits(data);
+        if let Some(ref mut curr) = self.curr {
+            let source = [curr, data];
+            let data = Bits::new_many(source.iter());
+            let x = pedersen_compression_bits(data);
+            x.write_le(std::io::Cursor::new(&mut curr[..]))
+                .context("failed to write result")?;
+        } else {
+            let data = Bits::new(data);
+            let x = pedersen_compression_bits(data);
+            let mut curr = [0u8; 32];
+            x.write_le(std::io::Cursor::new(&mut curr[..]))
+                .context("failed to write result")?;
+            self.curr = Some(curr);
+        }
 
-        x.write_le(std::io::Cursor::new(&mut self.curr[..]))
-            .context("failed to write result")?;
         Ok(())
     }
 
     pub fn finalize_bytes(self) -> [u8; 32] {
         let Hasher { curr } = self;
-        curr
+        curr.expect("missed init")
     }
 
     pub fn finalize(self) -> Result<Fr> {
-        let frs = bytes_into_frs::<Bls12>(&self.curr)
+        let frs = bytes_into_frs::<Bls12>(&self.curr.expect("missed init"))
             .context("pedersen must generate valid fr elements")?;
         ensure!(frs.len() == 1, "There must be a single fr element.");
         Ok(frs[0])
@@ -296,7 +309,7 @@ impl<T: AsRef<[u8]>, S: Iterator<Item = T>> Iterator for Bits<T, S> {
 mod tests {
     use super::*;
     use crate::util::bytes_into_bits;
-    use bitvec::{self, BitVec};
+    use bitvec::{bitvec, order::Lsb0};
     use ff::Field;
     use paired::bls12_381::Fr;
     use rand::{Rng, SeedableRng};
@@ -307,13 +320,10 @@ mod tests {
         let bytes = b"ABC";
         let bits = bytes_into_bits(bytes);
 
-        let mut bits2 = core::iter::repeat(false)
-            .take(bits.len())
-            .collect::<BitVec<bitvec::LittleEndian, u8>>();
+        let mut bits2 = bitvec![Lsb0, u8; 0; bits.len()];
+        bits2.as_mut_slice()[0..bytes.len()].copy_from_slice(&bytes[..]);
 
-        bits2.as_mut()[0..bytes.len()].copy_from_slice(&bytes[..]);
-
-        assert_eq!(bits, bits2.iter().collect::<Vec<bool>>());
+        assert_eq!(bits, bits2.iter().copied().collect::<Vec<bool>>());
     }
 
     #[test]

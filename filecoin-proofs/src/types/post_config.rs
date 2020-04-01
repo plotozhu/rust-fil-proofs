@@ -1,17 +1,20 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-
 use paired::bls12_381::Bls12;
-use storage_proofs::circuit::election_post::{ElectionPoStCircuit, ElectionPoStCompound};
-use storage_proofs::drgraph::DefaultTreeHasher;
 use storage_proofs::parameter_cache::{self, CacheableParameters};
+use storage_proofs::post::election::{ElectionPoStCircuit, ElectionPoStCompound};
 
+use crate::constants::DefaultTreeHasher;
 use crate::types::*;
 
 #[derive(Clone, Copy, Debug)]
 pub struct PoStConfig {
     pub sector_size: SectorSize,
+    pub challenge_count: usize,
+    pub challenged_nodes: usize,
+    /// High priority (always runs on GPU) == true
+    pub priority: bool,
 }
 
 impl From<PoStConfig> for PaddedBytesAmount {

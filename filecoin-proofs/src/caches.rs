@@ -7,19 +7,15 @@ use bellperson::groth16;
 use lazy_static::lazy_static;
 use log::info;
 use paired::bls12_381::Bls12;
-use storage_proofs::circuit::election_post::ElectionPoStCircuit;
-use storage_proofs::circuit::election_post::ElectionPoStCompound;
-use storage_proofs::circuit::stacked::StackedCompound;
 use storage_proofs::compound_proof::CompoundProof;
-use storage_proofs::drgraph::DefaultTreeHasher;
-use storage_proofs::election_post::ElectionPoSt;
-use storage_proofs::stacked::StackedDrg;
+use storage_proofs::porep::stacked::{StackedCompound, StackedDrg};
+use storage_proofs::post::election::{ElectionPoSt, ElectionPoStCircuit, ElectionPoStCompound};
 
-use crate::constants::DefaultPieceHasher;
+use crate::constants::{DefaultPieceHasher, DefaultTreeHasher};
 use crate::parameters::{post_public_params, public_params};
 use crate::types::*;
 
-type Bls12GrothParams = groth16::Parameters<Bls12>;
+type Bls12GrothParams = groth16::MappedParameters<Bls12>;
 pub type Bls12VerifyingKey = groth16::VerifyingKey<Bls12>;
 
 type Cache<G> = HashMap<String, Arc<G>>;
@@ -79,14 +75,14 @@ where
     cache_lookup(&*VERIFYING_KEY_MEMORY_CACHE, vk_identifier, generator)
 }
 
-pub fn get_stacked_params(porep_config: PoRepConfig) -> Result<Arc<groth16::Parameters<Bls12>>> {
+pub fn get_stacked_params(porep_config: PoRepConfig) -> Result<Arc<Bls12GrothParams>> {
     let public_params = public_params(
         PaddedBytesAmount::from(porep_config),
         usize::from(PoRepProofPartitions::from(porep_config)),
     )?;
 
     let parameters_generator = || {
-        <StackedCompound as CompoundProof<
+        <StackedCompound<DefaultTreeHasher, DefaultPieceHasher> as CompoundProof<
             _,
             StackedDrg<DefaultTreeHasher, DefaultPieceHasher>,
             _,
@@ -103,7 +99,7 @@ pub fn get_stacked_params(porep_config: PoRepConfig) -> Result<Arc<groth16::Para
     )?)
 }
 
-pub fn get_post_params(post_config: PoStConfig) -> Result<Arc<groth16::Parameters<Bls12>>> {
+pub fn get_post_params(post_config: PoStConfig) -> Result<Arc<Bls12GrothParams>> {
     let post_public_params = post_public_params(post_config)?;
 
     let parameters_generator = || {
@@ -131,7 +127,7 @@ pub fn get_stacked_verifying_key(porep_config: PoRepConfig) -> Result<Arc<Bls12V
     )?;
 
     let vk_generator = || {
-        <StackedCompound as CompoundProof<
+        <StackedCompound<DefaultTreeHasher, DefaultPieceHasher> as CompoundProof<
             Bls12,
             StackedDrg<DefaultTreeHasher, DefaultPieceHasher>,
             _,

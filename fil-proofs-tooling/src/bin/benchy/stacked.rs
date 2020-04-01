@@ -8,22 +8,24 @@ use chrono::Utc;
 use log::info;
 use memmap::MmapMut;
 use memmap::MmapOptions;
-use merkletree::store::{StoreConfig, DEFAULT_CACHED_ABOVE_BASE_LAYER};
+use merkletree::store::StoreConfig;
 use paired::bls12_381::Bls12;
 use rand::Rng;
 use serde::Serialize;
 
 use fil_proofs_tooling::{measure, FuncMeasurement, Metadata};
-use storage_proofs::circuit::bench::BenchCS;
-use storage_proofs::circuit::stacked::StackedCompound;
+use storage_proofs::cache_key::CacheKey;
 use storage_proofs::compound_proof::{self, CompoundProof};
 use storage_proofs::drgraph::*;
+use storage_proofs::gadgets::BenchCS;
 use storage_proofs::hasher::{Blake2sHasher, Domain, Hasher, PedersenHasher, Sha256Hasher};
+use storage_proofs::porep::stacked::StackedCompound;
+use storage_proofs::porep::stacked::{
+    self, ChallengeRequirements, LayerChallenges, StackedDrg, TemporaryAuxCache, BINARY_ARITY,
+    EXP_DEGREE,
+};
 use storage_proofs::porep::PoRep;
 use storage_proofs::proof::ProofScheme;
-use storage_proofs::stacked::{
-    self, CacheKey, ChallengeRequirements, StackedConfig, StackedDrg, TemporaryAuxCache, EXP_DEGREE,
-};
 use tempfile::TempDir;
 
 fn file_backed_mmap_from_zeroes(n: usize, use_tmp: bool) -> anyhow::Result<MmapMut> {
@@ -46,7 +48,7 @@ fn file_backed_mmap_from_zeroes(n: usize, use_tmp: bool) -> anyhow::Result<MmapM
 }
 
 fn dump_proof_bytes<H: Hasher>(
-    all_partition_proofs: &[stacked::Proof<H, Sha256Hasher>],
+    all_partition_proofs: &[Vec<stacked::Proof<H, Sha256Hasher>>],
 ) -> anyhow::Result<()> {
     let file = OpenOptions::new()
         .write(true)
@@ -62,10 +64,9 @@ fn dump_proof_bytes<H: Hasher>(
 #[derive(Clone, Debug)]
 struct Params {
     samples: usize,
-    window_size_nodes: usize,
     data_size: usize,
-    config: StackedConfig,
     partitions: usize,
+    layer_challenges: LayerChallenges,
     circuit: bool,
     groth: bool,
     bench: bool,
@@ -83,10 +84,9 @@ impl From<Params> for Inputs {
             partitions: p.partitions,
             hasher: p.hasher.clone(),
             samples: p.samples,
-            layers: p.config.layers(),
-            partition_challenges: p.config.window_challenges.challenges_count_all(),
-            total_challenges: p.config.window_challenges.challenges_count_all() * p.partitions,
-            config: p.config,
+            layers: p.layer_challenges.layers(),
+            partition_challenges: p.layer_challenges.challenges_count_all() / p.partitions,
+            total_challenges: p.layer_challenges.challenges_count_all(),
         }
     }
 }
@@ -108,7 +108,6 @@ where
         let Params {
             samples,
             data_size,
-            config,
             partitions,
             circuit,
             groth,
@@ -117,17 +116,9 @@ where
             use_tmp,
             dump_proofs,
             bench_only,
-            window_size_nodes,
+            layer_challenges,
             ..
         } = &params;
-
-        // MT for original data is always named tree-d, and it will be
-        // referenced later in the process as such.
-        let store_config = StoreConfig::new(
-            cache_dir.path(),
-            CacheKey::CommDTree.to_string(),
-            DEFAULT_CACHED_ABOVE_BASE_LAYER,
-        );
 
         let mut total_proving_wall_time = Duration::new(0, 0);
         let mut total_proving_cpu_time = Duration::new(0, 0);
@@ -135,14 +126,21 @@ where
         let rng = &mut rand::thread_rng();
         let nodes = data_size / 32;
 
+        // MT for original data is always named tree-d, and it will be
+        // referenced later in the process as such.
+        let store_config = StoreConfig::new(
+            cache_dir.path(),
+            CacheKey::CommDTree.to_string(),
+            StoreConfig::default_cached_above_base_layer(nodes, BINARY_ARITY),
+        );
+
         let replica_id = H::Domain::random(rng);
         let sp = stacked::SetupParams {
             nodes,
             degree: BASE_DEGREE,
             expansion_degree: EXP_DEGREE,
             seed: new_seed(),
-            config: config.clone(),
-            window_size_nodes: *window_size_nodes,
+            layer_challenges: layer_challenges.clone(),
         };
 
         let pp = StackedDrg::<H, Sha256Hasher>::setup(&sp)?;
@@ -151,6 +149,12 @@ where
             (None, None, None)
         } else {
             let mut data = file_backed_mmap_from_zeroes(nodes, *use_tmp)?;
+
+            // Generate a replica path.
+            let replica_dir = tempfile::tempdir().unwrap();
+            let temp_path = replica_dir.path();
+            let replica_path = temp_path.join("replica-path");
+
             let seed = rng.gen();
 
             let FuncMeasurement {
@@ -161,9 +165,10 @@ where
                 let (tau, (p_aux, t_aux)) = StackedDrg::<H, Sha256Hasher>::replicate(
                     &pp,
                     &replica_id,
-                    &mut data,
+                    (&mut data[..]).into(),
                     None,
-                    Some(store_config.clone()),
+                    store_config.clone(),
+                    replica_path.clone(),
                 )?;
 
                 let pb = stacked::PublicInputs::<H::Domain, <Sha256Hasher as Hasher>::Domain> {
@@ -175,8 +180,8 @@ where
 
                 // Convert TemporaryAux to TemporaryAuxCache, which instantiates all
                 // elements based on the configs stored in TemporaryAux.
-                let t_aux =
-                    TemporaryAuxCache::new(&t_aux).expect("failed to restore contents of t_aux");
+                let t_aux = TemporaryAuxCache::new(&t_aux, replica_path)
+                    .expect("failed to restore contents of t_aux");
 
                 let pv = stacked::PrivateInputs { p_aux, t_aux };
 
@@ -344,13 +349,16 @@ fn do_circuit_work<H: 'static + Hasher>(
     let compound_public_params = compound_proof::PublicParams {
         vanilla_params: pp.clone(),
         partitions: Some(*partitions),
+        priority: false,
     };
 
     if *bench || *circuit || *bench_only {
         info!("Generating blank circuit: start");
         let mut cs = BenchCS::<Bls12>::new();
-        <StackedCompound as CompoundProof<_, StackedDrg<H, Sha256Hasher>, _>>::blank_circuit(&pp)
-            .synthesize(&mut cs)?;
+        <StackedCompound<_, _> as CompoundProof<_, StackedDrg<H, Sha256Hasher>, _>>::blank_circuit(
+            &pp,
+        )
+        .synthesize(&mut cs)?;
 
         report.outputs.circuit_num_inputs = Some(cs.num_inputs() as u64);
         report.outputs.circuit_num_constraints = Some(cs.num_constraints() as u64);
@@ -365,10 +373,13 @@ fn do_circuit_work<H: 'static + Hasher>(
         // We should implement a method of CompoundProof, which will skip vanilla proving.
         // We should also allow the serialized vanilla proofs to be passed (as a file) to the example
         // and skip replication/vanilla-proving entirely.
-        let gparams =
-            <StackedCompound as CompoundProof<_, StackedDrg<H, Sha256Hasher>, _>>::groth_params::<
-                rand::rngs::OsRng,
-            >(None, &compound_public_params.vanilla_params)?;
+        let gparams = <StackedCompound<_, _> as CompoundProof<
+            _,
+            StackedDrg<H, Sha256Hasher>,
+            _,
+        >>::groth_params::<rand::rngs::OsRng>(
+            None, &compound_public_params.vanilla_params
+        )?;
 
         let multi_proof = {
             let FuncMeasurement {
@@ -435,7 +446,6 @@ struct Inputs {
     layers: usize,
     partition_challenges: usize,
     total_challenges: usize,
-    config: StackedConfig,
 }
 
 #[derive(Serialize, Default)]
@@ -481,9 +491,7 @@ impl Report {
 pub struct RunOpts {
     pub bench: bool,
     pub bench_only: bool,
-    pub window_size_nodes: usize,
-    pub window_challenges: usize,
-    pub wrapper_challenges: usize,
+    pub challenges: usize,
     pub circuit: bool,
     pub dump: bool,
     pub extract: bool,
@@ -497,12 +505,12 @@ pub struct RunOpts {
 }
 
 pub fn run(opts: RunOpts) -> anyhow::Result<()> {
-    let config = StackedConfig::new(opts.layers, opts.window_challenges, opts.wrapper_challenges)?;
+    let layer_challenges = LayerChallenges::new(opts.layers, opts.challenges);
 
     let params = Params {
-        config,
         data_size: opts.size * 1024,
         partitions: opts.partitions,
+        layer_challenges,
         use_tmp: !opts.no_tmp,
         dump_proofs: opts.dump,
         groth: opts.groth,
@@ -511,7 +519,6 @@ pub fn run(opts: RunOpts) -> anyhow::Result<()> {
         circuit: opts.circuit,
         extract: opts.extract,
         hasher: opts.hasher,
-        window_size_nodes: opts.window_size_nodes,
         samples: 5,
     };
 
