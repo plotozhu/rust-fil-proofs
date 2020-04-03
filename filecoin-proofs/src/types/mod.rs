@@ -39,7 +39,7 @@ pub type DataTree = storage_proofs::porep::stacked::BinaryTree<DefaultPieceHashe
 pub const OCT_ARITY: usize = 8;
 
 /// Arity for binary trees, used for comm_d.
-pub const BINARY_ARITY: usize = 8;
+pub const BINARY_ARITY: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct SealPreCommitOutput {
