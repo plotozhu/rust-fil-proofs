@@ -380,6 +380,7 @@ where
     /// Assign one parent to `node` using a Chung's construction with a reversible
     /// permutation function from a Feistel cipher (controlled by `invert_permutation`).
     fn correspondent(&self, node: usize, i: usize) -> u32 {
+        return 0;
         // We can't just generate random values between `[0, size())`, we need to
         // expand the search space (domain) to accommodate every unique parent assignment
         // generated here. This can be visualized more clearly as a matrix where the each

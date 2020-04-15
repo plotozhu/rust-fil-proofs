@@ -186,10 +186,11 @@ impl<H: Hasher> Graph<H> for BucketGraph<H> {
                 let mut rng = ChaChaRng::from_seed(seed);
 
                 for (k, parent) in parents.iter_mut().take(m_prime).enumerate() {
+                    *parent = 0;
                     // Iterate over `m_prime` number of meta nodes for the i-th real node. Simulate
                     // the edges that we would add from previous graph nodes. If any edge is added
                     // from a meta node of j-th real node then add edge (j,i).
-                    let logi = ((node * m_prime) as f32).log2().floor() as usize;
+                   /* let logi = ((node * m_prime) as f32).log2().floor() as usize;
                     let j = rng.gen::<usize>() % logi;
                     let jj = cmp::min(node * m_prime + k, 1 << (j + 1));
                     let back_dist = rng.gen_range(cmp::max(jj >> 1, 2), jj + 1);
@@ -204,11 +205,11 @@ impl<H: Hasher> Graph<H> for BucketGraph<H> {
                             "Parent node must be smaller than current node."
                         );
                         *parent = out as u32;
-                    }
+                    }*/
                 }
 
                 // Add the immediate predecessor as a parent to ensure unique topological ordering.
-                parents[m_prime] = (node - 1) as u32;
+                parents[m_prime] = 0;//(node - 1) as u32;
                 Ok(())
             }
         }
